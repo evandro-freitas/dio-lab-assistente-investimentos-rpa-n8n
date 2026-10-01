@@ -1,0 +1,290 @@
+{
+  "name": "Assistente de Investimentos - RPA DIO",
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "// Code node: Cruzar perfis\n// Responsabilidade única: cruzar clientes com o catálogo pelo perfil e devolver uma tabela.\n// Não cria mensagens nem templates; isso fica no Code node após o Merge.\nconst webhook = $('Webhook - Clientes1').first().json;\nconst payload = webhook.body ?? webhook;\nconst clientes = payload.clientes;\nif (!Array.isArray(clientes) || clientes.length === 0) {\n  throw new Error('O webhook deve receber uma lista não vazia em clientes[].');\n}\n\nconst response = $input.first()?.json ?? {};\nconst csvText = typeof response.data === 'string'\n  ? response.data\n  : (typeof response.body === 'string' ? response.body : '');\nif (!csvText.trim()) throw new Error('Não foi possível obter o conteúdo do CSV de investimentos.');\n\nfunction parseCsv(text) {\n  const rows = [];\n  let row = [];\n  let cell = '';\n  let quoted = false;\n  for (let i = 0; i < text.length; i++) {\n    const ch = text[i];\n    if (ch === '\"') {\n      if (quoted && text[i + 1] === '\"') { cell += '\"'; i++; }\n      else quoted = !quoted;\n    } else if (ch === ',' && !quoted) {\n      row.push(cell.trim()); cell = '';\n    } else if ((ch === '\\n' || ch === '\\r') && !quoted) {\n      if (ch === '\\r' && text[i + 1] === '\\n') i++;\n      row.push(cell.trim());\n      if (row.some(value => value !== '')) rows.push(row);\n      row = []; cell = '';\n    } else {\n      cell += ch;\n    }\n  }\n  row.push(cell.trim());\n  if (row.some(value => value !== '')) rows.push(row);\n  return rows;\n}\n\nfunction normalize(value) {\n  return String(value ?? '').normalize('NFD')\n    .replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();\n}\nfunction parseNumber(value) {\n  const raw = String(value ?? '').replace(/[^0-9,.-]/g, '');\n  if (!raw) return 0;\n  const normalized = raw.includes(',')\n    ? raw.replace(/\\./g, '').replace(',', '.')\n    : raw;\n  const number = Number(normalized);\n  return Number.isFinite(number) ? number : 0;\n}\nfunction parseSaldo(value) {\n  return parseNumber(String(value ?? '').replace(/r\\$/i, ''));\n}\n\nconst rows = parseCsv(csvText.replace(/^\\uFEFF/, ''));\nif (rows.length < 2) throw new Error('O CSV não possui opções de investimento.');\nconst headers = rows[0].map(normalize);\nconst indexes = Object.fromEntries(\n  ['perfil', 'produto', 'minimo', 'rentabilidade']\n    .map(key => [key, headers.indexOf(key)])\n);\nif (Object.values(indexes).some(index => index < 0)) {\n  throw new Error('CSV deve conter as colunas perfil,produto,minimo,rentabilidade.');\n}\nconst catalogo = rows.slice(1).map(row => ({\n  perfil: row[indexes.perfil],\n  produto: row[indexes.produto],\n  minimo: parseNumber(row[indexes.minimo]),\n  rentabilidade: row[indexes.rentabilidade],\n})).filter(item => item.perfil && item.produto);\n\n// Uma linha por combinação cliente × produto do perfil. A elegibilidade por saldo\n// é um campo da tabela; seleção final e texto ficam no próximo Code node.\nconst tabelaCruzada = clientes.flatMap((cliente, clienteIndex) => {\n  const perfil = normalize(cliente.perfil);\n  const opcoesDoPerfil = catalogo.filter(item => normalize(item.perfil) === perfil);\n  if (opcoesDoPerfil.length === 0) {\n    return [{\n      clienteIndex,\n      nome: cliente.nome ?? '',\n      email: cliente.email ?? '',\n      saldo: cliente.saldo ?? '',\n      saldoNumerico: parseSaldo(cliente.saldo),\n      perfil: cliente.perfil ?? '',\n      produto: null,\n      minimo: null,\n      rentabilidade: null,\n      elegivelPorSaldo: false,\n    }];\n  }\n  return opcoesDoPerfil.map(item => ({\n    clienteIndex,\n    nome: cliente.nome ?? '',\n    email: cliente.email ?? '',\n    saldo: cliente.saldo ?? '',\n    saldoNumerico: parseSaldo(cliente.saldo),\n    perfil: cliente.perfil ?? '',\n    produto: item.produto,\n    minimo: item.minimo,\n    rentabilidade: item.rentabilidade,\n    elegivelPorSaldo: item.minimo <= parseSaldo(cliente.saldo),\n  }));\n});\n\nreturn [{\n  json: {\n    requestId: payload.requestId ?? null,\n    totalClientes: clientes.length,\n    totalLinhasTabela: tabelaCruzada.length,\n    tabelaCruzada,\n  },\n}];\n"
+      },
+      "id": "cf3464ce-962c-46ca-9ec1-05ad0b6f443a",
+      "name": "Cruzar perfis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1552,
+        -640
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code node: Montar mensagens (após Merge)\n// Responsabilidade: consumir o payload original + tabelaCruzada e montar a resposta.\nconst merged = $input.first()?.json ?? {};\nconst payload = merged.body ?? merged;\nconst clientes = payload.clientes;\nconst tabela = merged.tabelaCruzada;\nif (!Array.isArray(clientes)) {\n  throw new Error('O Merge deve preservar o payload original em body.clientes[].');\n}\nif (!Array.isArray(tabela)) {\n  throw new Error('O Merge deve entregar a tabelaCruzada do nó Cruzar perfis.');\n}\n\nfunction normalize(value) {\n  return String(value ?? '').normalize('NFD')\n    .replace(/[\\u0300-\\u036f]/g, '').trim().toLowerCase();\n}\nfunction moeda(value) {\n  return new Intl.NumberFormat('pt-BR', {\n    style: 'currency', currency: 'BRL',\n  }).format(value);\n}\nconst templates = {\n  conservador: 'Seu perfil prioriza previsibilidade e preservação do capital. Compare opções, liquidez e riscos antes de decidir.',\n  moderado: 'Seu perfil busca equilíbrio entre previsibilidade e potencial de crescimento. Compare composição, riscos e prazos.',\n  arrojado: 'Seu perfil aceita maior oscilação em busca de potencial de crescimento. Diversificação e entendimento dos riscos continuam essenciais.',\n};\n\nconst resultados = clientes.map((cliente, clienteIndex) => {\n  const perfilKey = normalize(cliente.perfil);\n  const template = templates[perfilKey];\n  if (!template) {\n    throw new Error(`Perfil inválido para o cliente ${clienteIndex + 1}: ${cliente.perfil}`);\n  }\n  const linhasCliente = tabela.filter(row => row.clienteIndex === clienteIndex);\n  const elegiveis = linhasCliente\n    .filter(row => row.elegivelPorSaldo && row.produto)\n    .sort((a, b) => b.minimo - a.minimo);\n  const investimento = elegiveis[0] ?? null;\n  const saldo = linhasCliente[0]?.saldoNumerico ?? 0;\n  const detalhe = investimento\n    ? `Uma opção do catálogo para explorar é ${investimento.produto} (aplicação mínima: ${moeda(investimento.minimo)}; rentabilidade indicada no CSV: ${investimento.rentabilidade}).`\n    : 'Não há opção do catálogo com aplicação mínima igual ou inferior ao saldo informado; nenhuma opção foi selecionada.';\n  const nome = String(cliente.nome ?? 'cliente').trim();\n  return {\n    cliente: {\n      nome,\n      email: cliente.email ?? '',\n      saldo: cliente.saldo ?? '',\n      perfil: cliente.perfil,\n    },\n    investimento,\n    mensagem: `Olá, ${nome}! ${template} ${detalhe} Saldo informado: ${moeda(saldo)}.`,\n    aviso: 'Demonstração educacional com dados fictícios. Não constitui recomendação individual de investimento; rentabilidade passada ou estimada não garante retorno.',\n  };\n});\n\nreturn [{\n  json: {\n    requestId: merged.requestId ?? payload.requestId ?? null,\n    totalClientes: resultados.length,\n    resultados,\n  },\n}];\n"
+      },
+      "id": "bcf3430d-449f-46a9-8340-2e30722708ab",
+      "name": "Code - Montar mensagens",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2000,
+        -640
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "assistente-investimentos",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "9da210fe-d8f2-4f4e-85a0-446f745f3a9a",
+      "name": "Webhook - Clientes1",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        1104,
+        -720
+      ],
+      "webhookId": "b9a06a9e-2ce0-4f4f-8e51-4a042c5e0991"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.body.investimentosCsvUrl || 'https://digitalinnovationone.github.io/dio-lab-assistente-investimentos-rpa-n8n/data.csv' }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "id": "525d6cd2-fc54-4d58-8307-66c1d0a39a1a",
+      "name": "Baixar catálogo CSV1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1328,
+        -640
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1776,
+        -720
+      ],
+      "id": "fa5c03bd-7e5c-4e15-8fe7-c2af0b3def13",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "c4b6d88e-510c-45e8-8d19-7b909ddd1a8f",
+      "name": "Responder ao RPA1",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        3400,
+        -720
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code node: code normalizar para llm\n// Run Once for All Items. Converte resultados[] em N items: um por destinatário.\nconst itens = $input.all().map(item => item.json ?? {});\nif (itens.length === 0) throw new Error('O node não recebeu dados para normalizar.');\n\nconst envelope = itens.find(item => Array.isArray(item.resultados)) ?? itens[0];\nconst resultados = Array.isArray(envelope.resultados) ? envelope.resultados : itens;\nif (resultados.length === 0) throw new Error('Não há resultados de clientes para organizar.');\n\nfunction texto(value, fallback = '') {\n  return String(value ?? fallback).trim();\n}\nfunction normalizarChave(value) {\n  return texto(value).normalize('NFD')\n    .replace(/[\\u0300-\\u036f]/g, '')\n    .toLowerCase()\n    .replace(/[^a-z0-9]+/g, ' ')\n    .trim();\n}\nfunction normalizarPerfil(value) {\n  const perfis = {\n    conservador: 'Conservador', conservadora: 'Conservador',\n    moderado: 'Moderado', moderada: 'Moderado',\n    arrojado: 'Arrojado', arrojada: 'Arrojado',\n    agressivo: 'Arrojado', agressiva: 'Arrojado',\n  };\n  return perfis[normalizarChave(value)] ?? 'Não identificado';\n}\nfunction normalizarEmail(value) {\n  return texto(value).toLowerCase();\n}\nfunction numeroBR(value) {\n  if (typeof value === 'number' && Number.isFinite(value)) return value;\n  const original = texto(value);\n  if (!original) return null;\n  const raw = original.replace(/[^0-9,.-]/g, '');\n  if (!raw) return null;\n  const parsed = Number(raw.includes(',')\n    ? raw.replace(/\\./g, '').replace(',', '.')\n    : raw);\n  return Number.isFinite(parsed) ? parsed : null;\n}\nfunction moedaBR(value) {\n  return value === null ? 'Não informado' : new Intl.NumberFormat('pt-BR', {\n    style: 'currency', currency: 'BRL', minimumFractionDigits: 2,\n  }).format(value);\n}\n\nconst registros = resultados.map((resultado, index) => {\n  const cliente = resultado.cliente ?? resultado;\n  const investimento = resultado.investimento ?? {};\n  const emailOriginal = texto(cliente.email ?? resultado.email);\n  const perfilOriginal = texto(cliente.perfil ?? resultado.perfil);\n  const saldoBrl = numeroBR(cliente.saldo ?? resultado.saldo);\n  const minimoBrl = numeroBR(investimento.minimo ?? resultado.aplicacao_minima_brl);\n  return {\n    requestId: envelope.requestId ?? resultado.requestId ?? null,\n    linha: index + 1,\n    totalClientes: resultados.length,\n    nome: texto(cliente.nome ?? resultado.nome, 'Cliente'),\n    email_original: emailOriginal,\n    email: normalizarEmail(emailOriginal),\n    email_valido: /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(normalizarEmail(emailOriginal)),\n    perfil_original: perfilOriginal || 'Não informado',\n    perfil_normalizado: normalizarPerfil(perfilOriginal),\n    saldo_brl: saldoBrl,\n    saldo_formatado: moedaBR(saldoBrl),\n    produto_catalogo: texto(investimento.produto ?? resultado.produto_catalogo, 'Sem opção selecionada'),\n    aplicacao_minima_brl: minimoBrl,\n    aplicacao_minima_formatada: moedaBR(minimoBrl),\n    rentabilidade_catalogo: texto(investimento.rentabilidade ?? resultado.rentabilidade_catalogo, 'Não informada'),\n    mensagem_base: texto(resultado.mensagem),\n    aviso_educacional: texto(resultado.aviso),\n  };\n});\n\n// O e-mail fica como metadado para a etapa seguinte, mas não é incluído no prompt enviado ao Groq.\nreturn registros.map(registro => {\n  const dadosParaMensagem = {\n    linha: registro.linha,\n    nome: registro.nome,\n    perfil: registro.perfil_normalizado,\n    saldo: registro.saldo_formatado,\n    produto_catalogo: registro.produto_catalogo,\n    aplicacao_minima: registro.aplicacao_minima_formatada,\n    rentabilidade_catalogo: registro.rentabilidade_catalogo,\n    mensagem_base: registro.mensagem_base,\n    aviso_educacional: registro.aviso_educacional,\n  };\n  const promptLLM = [\n    'Gere uma mensagem curta e natural em português do Brasil para este único cliente.',\n    'Use exclusivamente os dados abaixo; não invente valores, produtos ou rentabilidades.',\n    'Não prometa retorno nem faça recomendação individual de investimento.',\n    'Preserve o aviso educacional. Retorne somente JSON válido, sem Markdown, no formato {\"mensagem\":\"texto da mensagem\"}.',\n    '',\n    'Dados do cliente (JSON):',\n    JSON.stringify(dadosParaMensagem, null, 2),\n  ].join('\\n');\n  return { json: { ...registro, promptLLM } };\n});\n",
+        "mode": "runOnceForAllItems"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2224,
+        -640
+      ],
+      "id": "f457158d-89c7-4a67-8cec-8cee34244161",
+      "name": "code normalizar para llm"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.promptLLM }}",
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.9,
+      "position": [
+        2624,
+        -720
+      ],
+      "id": "ce14fcb5-d0e4-4646-8c18-9a9de8c9122f",
+      "name": "Basic LLM Chain"
+    },
+    {
+      "parameters": {
+        "model": "allam-2-7b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGroq",
+      "typeVersion": 1,
+      "position": [
+        2624,
+        -512
+      ],
+      "id": "fc6dbe08-fe71-43c6-96d7-bef4a795b240",
+      "name": "Groq Chat Model",
+      "credentials": {
+        "groqApi": {
+          "id": "f4s5uXMIiTtYiFhX",
+          "name": "Groq account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Code node: Code - Normalizar saída LLM\n// Run Once for All Items. Junta cada resposta do LLM ao item/email correspondente\n// do node anterior e devolve um único envelope com resultados por destinatário.\nconst respostasLLM = $input.all().map(item => item.json ?? {});\nconst itensPreparados = $('code normalizar para llm').all().map(item => item.json ?? {});\nif (respostasLLM.length === 0) throw new Error('O LLM não retornou itens.');\nif (respostasLLM.length !== itensPreparados.length) {\n  throw new Error(`Quantidade de respostas do LLM (${respostasLLM.length}) diferente da quantidade de destinatários (${itensPreparados.length}). Verifique se o Basic LLM Chain processa cada item de entrada.`);\n}\n\nfunction extrairTexto(item) {\n  for (const key of ['text', 'output', 'response', 'answer', 'content']) {\n    if (typeof item[key] === 'string' && item[key].trim()) return item[key].trim();\n  }\n  const generation = item.generations?.[0]?.[0]?.text;\n  if (typeof generation === 'string' && generation.trim()) return generation.trim();\n  if (typeof item === 'string') return item.trim();\n  return JSON.stringify(item);\n}\nfunction interpretarResposta(raw) {\n  const semMarkdown = raw\n    .replace(/^\\s*```(?:json)?\\s*/i, '')\n    .replace(/\\s*```\\s*$/i, '')\n    .trim();\n  try {\n    const parsed = JSON.parse(semMarkdown);\n    if (typeof parsed === 'string') return { mensagem: parsed, parseOk: true };\n    const mensagem = parsed.mensagem ?? parsed.message ?? parsed.text;\n    if (typeof mensagem === 'string' && mensagem.trim()) {\n      return { mensagem: mensagem.trim(), parseOk: true };\n    }\n    const primeira = parsed.mensagens?.[0]?.mensagem ?? parsed.mensagens?.[0]?.message;\n    if (typeof primeira === 'string' && primeira.trim()) {\n      return { mensagem: primeira.trim(), parseOk: true };\n    }\n  } catch (_) {\n    // Alguns modelos devolvem texto simples mesmo quando o prompt pede JSON.\n  }\n  return { mensagem: semMarkdown, parseOk: false };\n}\n\nconst resultados = respostasLLM.map((resposta, index) => {\n  const preparado = itensPreparados[index];\n  const bruto = extrairTexto(resposta);\n  const interpretado = interpretarResposta(bruto);\n  const { promptLLM, ...dadosCliente } = preparado;\n  return {\n    ...dadosCliente,\n    mensagem_llm: interpretado.mensagem,\n    resposta_llm_em_json: interpretado.parseOk,\n  };\n});\n\nreturn [{\n  json: {\n    requestId: itensPreparados[0]?.requestId ?? null,\n    totalClientes: resultados.length,\n    resultados,\n  },\n}];\n"
+      },
+      "id": "4f1090b6-42ad-4f6f-a8e4-fa68e9803ead",
+      "name": "Code - Normalizar saída LLM",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3000,
+        -720
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Cruzar perfis": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Code - Montar mensagens": {
+      "main": [
+        [
+          {
+            "node": "code normalizar para llm",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook - Clientes1": {
+      "main": [
+        [
+          {
+            "node": "Baixar catálogo CSV1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Baixar catálogo CSV1": {
+      "main": [
+        [
+          {
+            "node": "Cruzar perfis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Code - Montar mensagens",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Responder ao RPA1": {
+      "main": [
+        []
+      ]
+    },
+    "code normalizar para llm": {
+      "main": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Basic LLM Chain",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Basic LLM Chain": {
+      "main": [
+        [
+          {
+            "node": "Code - Normalizar saída LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code - Normalizar saída LLM": {
+      "main": [
+        [
+          {
+            "node": "Responder ao RPA1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "versionId": "e2098d9f-b241-4647-bf07-1db345d1267d",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "45de1a206120373a3577e400d0d2df73a18759fb7e823780c9ef12e6b880ff18"
+  },
+  "nodeGroups": [],
+  "id": "d94a1YyDW0N3AK1n",
+  "tags": []
+}

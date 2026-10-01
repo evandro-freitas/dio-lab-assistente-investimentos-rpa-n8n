@@ -1,0 +1,24 @@
+{
+  "requestId": "demo-001",
+  "clientes": [
+    {
+      "nome": "Ana Silva",
+      "email": "ana@email.com",
+      "saldo": "R$ 12.500,00",
+      "perfil": "Conservador"
+    },
+    {
+      "nome": "Bruno Lima",
+      "email": "bruno@email.com",
+      "saldo": "R$ 3.200,00",
+      "perfil": "Moderado"
+    },
+    {
+      "nome": "Carla Souza",
+      "email": "carla@email.com",
+      "saldo": "R$ 28.900,00",
+      "perfil": "Arrojado"
+    }
+  ],
+  "investimentosCsvUrl": "https://digitalinnovationone.github.io/dio-lab-assistente-investimentos-rpa-n8n/data.csv"
+}
